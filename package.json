@@ -1,6 +1,6 @@
 {
   "name": "dsh-semantic-recall",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "type": "module",
   "main": "index.js",
@@ -11,7 +11,7 @@
     "./icon": "./icon.svg"
   },
   "description": "换新对话也不失忆：跨工作区索引最近 N 天的对话，用一句模糊描述召回过去的话题与原话；不确定时会反问而不是硬编（自带设置页）",
-  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "session", "semantic-search", "memory", "recall"],
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "session", "semantic-search", "memory", "recall", "chat", "conversation-memory", "rag", "ollama"],
   "license": "MIT",
   "author": "zhaohualiuyuejun",
   "engines": {

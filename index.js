@@ -14,14 +14,17 @@
  */
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { readdir, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { loadIndex, indexStats } from './lib/vectorstore.mjs'
 import { embedQuery, normalizeProvider } from './lib/embed.mjs'
 import { rankQuery, recentMenu, dayKeyOf } from './lib/search.mjs'
-import { buildIndex, currentBuildState, readBuildState } from './lib/indexer.mjs'
+import { buildIndex, currentBuildState, readBuildState, isBuilding } from './lib/indexer.mjs'
 import { buildDayCards, loadDayCards, dayMenuText } from './lib/days.mjs'
-import { stateDir, sessionsRoot, prettyWorkspace } from './lib/paths.mjs'
+import { stateDir, sessionsRoot, prettyWorkspace, metaPath, vectorsPath } from './lib/paths.mjs'
 import { readLocalConfigSync, writeLocalConfig, ensureLocalConfig, configPath } from './lib/localcfg.mjs'
+import { resolveWorkspaceDir } from './lib/workspace.mjs'
+import { parseSources, routeCaller } from './lib/policy.mjs'
+import { copyFile, mkdir } from 'node:fs/promises'
 
 const hostDeps = await loadHostDeps()
 const z = hostDeps.z
@@ -68,6 +71,16 @@ export const Config = !z ? undefined : z.object({
   /** 不索引的工作区 */
   excludeWorkspaces: z.string().default('').extra('volatile', true)
     .description('不索引哪些工作区：逗号分隔的目录名子串，例如 dsh-bili-duty,scratch-notes（留空=全部索引）'),
+  /** 只允许哪些工作区的会话调用检索（人格隔离） */
+  allowFromWorkspaces: z.string().default('').extra('volatile', true)
+    .description('人格隔离：只允许这些工作区（目录名子串，逗号分隔）里发起的会话调用检索；留空=不限制'),
+  /**
+   * 源工作区（一期：一档；二期：多档）。JSON 字符串：
+   * [{"id":"src1","name":"泽菲拉","workspaces":["--H-deepseek-zefeila--"]}]
+   * 留空 = 老行为（全部工作区都索引、都可检索）。
+   */
+  sources: z.string().default('').extra('volatile', true)
+    .description('源工作区：JSON 数组；留空=全部工作区（老行为）。每项 { id, name, workspaces:[会话目录名] }'),
 })
 
 const DEFAULTS = {
@@ -82,6 +95,8 @@ const DEFAULTS = {
   summaryModel: '',
   autoIndex: true,
   excludeWorkspaces: '',
+  allowFromWorkspaces: '',
+  sources: '',
 }
 
 /** 逐字段按默认值类型挑一遍（apply 的 config 值不保证是标量，见 2026-10-14 事故） */
@@ -161,8 +176,35 @@ export function apply(ctx, config) {
     return dispose
   }
 
+  /** 取「发起这次工具调用的会话」的工作目录（用于人格隔离）；拿不到返回 null */
+  const callerDir = async (exec) => {
+    try {
+      const wd = ctx.get?.('workingDirectory')
+      const agent = exec?.agent
+      if (!wd || !agent) return null
+      if (typeof wd.ensure === 'function') return await wd.ensure(agent)
+      if (typeof wd.get === 'function' && agent.session) return wd.get(agent.session)
+    } catch { /* 拿不到就算了 */ }
+    return null
+  }
+  const normPath = (s) => String(s || '').replace(/\\/g, '/').toLowerCase()
+  const allowList = (cfg) => String(cfg.allowFromWorkspaces || '')
+    .split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
+
+  /** sessions 下真实存在的工作区目录名（解析调用方归属用；缓存 5 秒） */
+  let wsDirsCache = { at: 0, dirs: [] }
+  const listWorkspaceDirs = async () => {
+    if (Date.now() - wsDirsCache.at < 5000) return wsDirsCache.dirs
+    let dirs = []
+    try {
+      const ents = await readdir(sessionsRoot(), { withFileTypes: true })
+      dirs = ents.filter((d) => d.isDirectory()).map((d) => d.name)
+    } catch { /* 读不到就给空：调用方按 fail-open 处理 */ }
+    wsDirsCache = { at: Date.now(), dirs }
+    return dirs
+  }
+
   // ---------------------------------------------------------------- 后台建索引
-  let buildPromise = null
 
   /** 用 DSH 自己的当前模型做总结（不填本地模型时走这条） */
   const llmDebug = () => {
@@ -213,22 +255,32 @@ export function apply(ctx, config) {
     }
   }
 
-  const runBuild = (cfg, { force = false, reason = '' } = {}) => {
-    if (buildPromise) return buildPromise
+  /** scopeKey → 正在跑的重建 promise（含话题卡阶段） */
+  const buildPromises = new Map()
+  const scopeKeyOf = (s) => (s ? String(s) : '')
+
+  /**
+   * 建某一个库（scope = null 为老单库）。
+   * wsAllow：该源的工作区白名单；null = 不限制；[] = 空源（什么都不索引）。
+   */
+  const runBuild = (cfg, { scope = null, wsAllow = null, force = false, reason = '' } = {}) => {
+    const k = scopeKeyOf(scope)
+    if (buildPromises.has(k)) return buildPromises.get(k)
     const eff = effectiveCfg(cfg)
-    log(`开始建索引（${eff.provider}${eff.degraded ? '，无 Key 降级为字面' : ''}）${reason ? ` · ${reason}` : ''}`)
-    buildPromise = (async () => {
-      const res = await buildIndex({ cfg: eff, force })
-      log(`建索引结果：${res.ok ? `OK 共 ${res.total} 块（新增 ${res.added}）` : `失败 ${res.error}`}`)
+    log(`开始建索引[${scope || '默认'}]（${eff.provider}${eff.degraded ? '，无 Key 降级为字面' : ''}）${reason ? ` · ${reason}` : ''}`)
+    const p = (async () => {
+      const res = await buildIndex({ cfg: eff, force, wsAllow, scope })
+      log(`建索引[${scope || '默认'}]结果：${res.ok ? `OK 共 ${res.total} 块（新增 ${res.added}）` : `失败 ${res.error}`}`)
       if (res.ok && liveCfg().daySummaries) {
-        let dbg = { at: new Date().toISOString() }
+        let dbg = { at: new Date().toISOString(), scope }
         try {
-          const loaded = await loadIndex()
+          const loaded = await loadIndex(scope)
           if (loaded) {
             const localModel = String(liveCfg().summaryModel || '').trim()
             dbg = { ...dbg, localModel, llm: llmDebug() }
             const raws = []
             const r = await buildDayCards({
+              scope,
               chunks: loaded.meta.chunks,
               days: eff.indexDays,
               model: localModel,
@@ -237,42 +289,103 @@ export function apply(ctx, config) {
               onRaw: (day, text) => raws.push({ day, len: String(text || '').length, head: String(text || '').slice(0, 300) }),
             })
             dbg = { ...dbg, raws, result: r }
-            if (r.generated) log(`话题卡：生成 ${r.generated} 天（${localModel || 'DSH 当前模型'}）`)
-            else if (r.error) log(`话题卡跳过：${r.error}`)
+            if (r.generated) log(`话题卡[${scope || '默认'}]：生成 ${r.generated} 天（${localModel || 'DSH 当前模型'}）`)
+            else if (r.error) log(`话题卡[${scope || '默认'}]跳过：${r.error}`)
           }
         } catch (e) {
           dbg = { ...dbg, error: String(e?.message || e) }
-          log(`话题卡失败：${e?.message || e}`)
+          log(`话题卡[${scope || '默认'}]失败：${e?.message || e}`)
         }
         try {
           await writeFile(join(stateDir(), 'days-state.json'), JSON.stringify(dbg, null, 1), 'utf8')
         } catch { /* 诊断写不进去也不致命 */ }
       }
       return res
-    })().finally(() => { buildPromise = null })
-    return buildPromise
+    })().finally(() => { buildPromises.delete(k) })
+    buildPromises.set(k, p)
+    return p
   }
 
-  /** 该不该建 / 增量：没有索引就建；有索引但会话文件更新了就增量 */
+  /**
+   * 对所有库触发重建：无源 = 老单库；有源 = 逐源（跳过空源与正在建的）。
+   * @param {string} only 只重建指定源（id 或名字）；空 = 全部
+   * @returns {{ started: string[], skipped: string[] }}
+   */
+  const rebuildAll = (cfg, { force = false, reason = '', only = '' } = {}) => {
+    const sources = parseSources(cfg.sources)
+    if (!sources.length) {
+      if (isBuilding(null)) return { started: [], skipped: ['默认'] }
+      runBuild(cfg, { scope: null, wsAllow: null, force, reason }).catch(() => {})
+      return { started: ['默认'], skipped: [] }
+    }
+    const started = []
+    const skipped = []
+    for (const s of sources) {
+      if (only && s.id !== only && s.name !== only) continue
+      if (!s.workspaces.length) { skipped.push(s.name); continue }
+      if (isBuilding(s.id)) { skipped.push(s.name); continue }
+      runBuild(cfg, { scope: s.id, wsAllow: s.workspaces, force, reason }).catch(() => {})
+      started.push(s.name)
+    }
+    return { started, skipped }
+  }
+
+  /** 某个库该不该建 / 增量：没有索引就建；有索引但（属于它的）会话文件更新了就增量 */
+  const ensureScopeBuilt = async (cfg, { scope = null, wsAllow = null, reason = '' }) => {
+    const loaded = await loadIndex(scope)
+    if (!loaded) { await runBuild(cfg, { scope, wsAllow, reason: reason || '首次' }); return }
+    // 换 provider / 模型 ⇒ 向量不可比，必须重建
+    const wantProvider = normalizeProvider(cfg.provider)
+    const wantModel = wantProvider === 'none' ? '' : (cfg.model || '')
+    const incompatible = normalizeProvider(loaded.meta.provider) !== wantProvider
+      || (wantProvider !== 'none' && wantModel && loaded.meta.model !== wantModel)
+    if (incompatible) { await runBuild(cfg, { scope, wsAllow, reason: '配置变更' }); return }
+    // 会话文件比索引新 ⇒ 增量（只算属于这个库的工作区）
+    const { listSessionFiles } = await import('./lib/extract.mjs')
+    const { files } = await listSessionFiles({ root: sessionsRoot(), days: cfg.indexDays })
+    const allow = Array.isArray(wsAllow) ? new Set(wsAllow) : null
+    const mine = allow ? files.filter((f) => allow.has(f.ws)) : files
+    const newest = mine.reduce((m, f) => Math.max(m, f.mtimeMs), 0)
+    const builtAt = new Date(loaded.meta.builtAt || 0).getTime()
+    if (newest > builtAt + 60000) await runBuild(cfg, { scope, wsAllow, reason: '有新的对话' })
+  }
+
+  /**
+   * 旧单库 → 第一个源的分库：**只复制、不删除**。
+   * 旧库留在 index/，作为「移除所有源后立刻可用」的回退。
+   */
+  const ensureScopeMigrated = async (sources) => {
+    const first = sources[0]
+    if (!first || !first.workspaces.length) return
+    const target = await loadIndex(first.id)
+    if (target) return
+    const legacy = await loadIndex(null)
+    if (!legacy) return
+    try {
+      await mkdir(dirname(metaPath(first.id)), { recursive: true })
+      await copyFile(metaPath(null), metaPath(first.id))
+      await copyFile(vectorsPath(null), vectorsPath(first.id))
+      log(`已把旧索引复制到源「${first.name}」的库（旧库保留作回退）`)
+    } catch (e) {
+      log(`旧索引迁移失败（不影响使用，会重建）：${e?.message || e}`)
+    }
+  }
+
   const maybeAutoBuild = async (reason) => {
     try {
       const cfg = effectiveCfg(liveCfg())
       if (!cfg.enabled || !cfg.autoIndex) return
-      const loaded = await loadIndex()
-      if (!loaded) { await runBuild(cfg, { reason: reason || '首次' }); return }
-      // 换 provider / 模型 ⇒ 向量不可比，必须重建
-      const wantProvider = normalizeProvider(cfg.provider)
-      const wantModel = wantProvider === 'none' ? '' : (cfg.model || '')
-      const incompatible = normalizeProvider(loaded.meta.provider) !== wantProvider
-        || (wantProvider !== 'none' && wantModel && loaded.meta.model !== wantModel)
-      if (incompatible) { await runBuild(cfg, { reason: '配置变更' }); return }
-      // 会话文件比索引新 ⇒ 增量
-      const { listSessionFiles } = await import('./lib/extract.mjs')
-      const { sessionsRoot } = await import('./lib/paths.mjs')
-      const { files } = await listSessionFiles({ root: sessionsRoot(), days: cfg.indexDays })
-      const newest = files.reduce((m, f) => Math.max(m, f.mtimeMs), 0)
-      const builtAt = new Date(loaded.meta.builtAt || 0).getTime()
-      if (newest > builtAt + 60000) await runBuild(cfg, { reason: '有新的对话' })
+      const sources = parseSources(liveCfg().sources)
+      if (!sources.length) {
+        // 老行为：所有工作区共用一个库
+        await ensureScopeBuilt(cfg, { scope: null, wsAllow: null, reason })
+        return
+      }
+      await ensureScopeMigrated(sources)
+      for (const s of sources) {
+        if (!s.workspaces.length) continue
+        await ensureScopeBuilt(cfg, { scope: s.id, wsAllow: s.workspaces, reason })
+      }
     } catch (e) {
       log(`自动索引检查失败（已忽略）：${e?.message || e}`)
     }
@@ -296,35 +409,139 @@ export function apply(ctx, config) {
       query: { type: 'string', description: '用户的原始描述或关键词（不用清洗；工具会自己处理「你还记得」这类虚词与时间词）' },
       days: { type: 'number', description: '只找最近 N 天（不填 = 用设置里的索引天数）' },
       role: { type: 'string', description: 'user=只看人说的 · assistant=只看 AI 说的 · 不填=都要' },
-      max_sessions: { type: 'number', description: '最多返回几场会话（默认 3）' },
+      max_sessions: { type: 'number', description: '最多返回几场会话（默认 3）；下钻模式下是最多返回几块（默认 20）' },
       include_active: { type: 'boolean', description: '是否包含最近 30 分钟内的活跃会话（默认 false，避免把当前这轮对话搜出来）' },
+      session: { type: 'string', description: '会话 id（session-xxxx）：直接下钻该会话的原文，跳过语义检索。记忆插件拿到 sourceSessionId 时用它' },
     },
-    async execute(args) {
+    async execute(args, exec) {
       const cfg = liveCfg()
       if (!cfg.enabled) {
         return { found: false, sessions: [], fallback_menu: [], note: '会话语义检索已在设置里关闭（设置 → 插件 → 会话语义检索 → 总开关）。' }
       }
       const query = String(args?.query || '').trim()
-      if (!query) return { found: false, sessions: [], fallback_menu: [], note: 'query 是空的：把用户的原话传进来。' }
+      const sessionHint = String(args?.session || '').trim()
+      if (!query && !sessionHint) {
+        return { found: false, sessions: [], fallback_menu: [], note: 'query 和 session 至少要给一个：给 query 做语义检索，给 session 做原文下钻。' }
+      }
+
+      // ── 准入与路由：多源时按调用方所属的源选库；没有源才退回老机制
+      const sources = parseSources(cfg.sources)
+      let caller = null
+      let scope = null
+      let routedSource = null
+      if (sources.length) {
+        caller = await callerDir(exec)
+        const known = await listWorkspaceDirs()
+        const wsDir = resolveWorkspaceDir(caller, known)
+        const route = routeCaller(wsDir, sources)
+        if (!route) {
+          const names = sources.map((s) => s.name).join(' / ')
+          return {
+            found: false,
+            sessions: [],
+            fallback_menu: [],
+            blocked: true,
+            caller: caller || null,
+            callerWorkspace: wsDir || null,
+            sources: sources.map((s) => s.name),
+            note: wsDir
+              ? `本会话的工作区（${prettyWorkspace(wsDir)}）不属于任何源（现有：${names}），因此不提供检索。要允许它，请到设置页把它加入某个源。`
+              : `定位不到本会话的工作区，而当前启用了源隔离（现有：${names}），因此不提供检索。`,
+          }
+        }
+        scope = route.scope
+        routedSource = route.source
+      } else {
+        // 人格隔离（老机制）：只允许指定工作区里发起的会话调用（留空=不限制）
+        const allow = allowList(cfg)
+        if (allow.length) {
+          caller = await callerDir(exec)
+          const ok = caller ? allow.some((a) => normPath(caller).includes(normPath(a))) : true
+          if (!ok) {
+            return {
+              found: false,
+              sessions: [],
+              fallback_menu: [],
+              blocked: true,
+              caller: caller || null,
+              note: `本会话的工作区不在允许调用检索的范围内（允许：${allow.join(' / ')}），因此不提供检索。`,
+            }
+          }
+        }
+      }
+
+      // ── 下钻模式：给了 session id 就直接返回该会话原文，不做语义检索
+      //    （给记忆插件用：topic 卡片带 sourceSessionId → 来到这里找回原话）
+      if (sessionHint) {
+        const loaded = await loadIndex(scope)
+        if (!loaded) {
+          return {
+            found: false, sessions: [], fallback_menu: [], mode: 'session-direct',
+            session: sessionHint, scope: scope || null,
+            note: '这个库还没有索引，没法下钻。',
+          }
+        }
+        const picks = []
+        for (let i = 0; i < loaded.meta.chunks.length; i++) {
+          const c = loaded.meta.chunks[i]
+          if (c.session === sessionHint) picks.push({ i, c })
+        }
+        if (!picks.length) {
+          return {
+            found: false, sessions: [], fallback_menu: [], mode: 'session-direct',
+            session: sessionHint, scope: scope || null,
+            note: '索引窗口里没有这个会话（可能不属于当前源，或已超出索引天数）。',
+          }
+        }
+        picks.sort((a, b) => a.c.t - b.c.t || (a.c.part || 0) - (b.c.part || 0))
+        const maxHits = Math.max(1, Math.min(Number(args?.max_sessions) || 20, 50))
+        const hits = picks.slice(0, maxHits).map(({ c }) => ({
+          time: new Date(c.t).toISOString(),
+          role: c.role,
+          messageId: c.msgId || null,
+          seq: c.seq ?? null,
+          text: c.text.length > 800 ? `${c.text.slice(0, 800)}…` : c.text,
+        }))
+        const times = picks.map((p) => p.c.t)
+        return {
+          found: true,
+          mode: 'session-direct',
+          session: sessionHint,
+          workspace: picks[0].c.wsPretty || picks[0].c.ws,
+          start: new Date(Math.min(...times)).toISOString(),
+          end: new Date(Math.max(...times)).toISOString(),
+          total_chunks: picks.length,
+          returned: hits.length,
+          hits,
+          index: { chunks: loaded.count, builtAt: loaded.meta.builtAt },
+          note: '按 session 直接下钻的原文（未做语义检索）。'
+            + (picks.length > hits.length ? `只返回前 ${hits.length} 块，可用 max_sessions 调整。` : ''),
+        }
+      }
 
       const maxSessions = Math.max(1, Math.min(Number(args?.max_sessions) || 3, 8))
       const days = Math.max(1, Math.min(Number(args?.days) || cfg.indexDays || 7, 365))
       const role = ['user', 'assistant'].includes(String(args?.role)) ? String(args.role) : undefined
       const includeActive = Boolean(args?.include_active)
 
-      const loaded = await loadIndex()
+      const loaded = await loadIndex(scope)
       if (!loaded) {
-        const st = currentBuildState()
+        const st = currentBuildState(scope)
+        const building = st.busy || buildPromises.has(scopeKeyOf(scope))
         // 没有索引：起一个后台建索引，这次先把话说清楚
-        if (cfg.autoIndex && !buildPromise) runBuild(cfg, { reason: '按需' }).catch(() => {})
+        if (cfg.autoIndex && !building) {
+          const wsAllow = routedSource ? routedSource.workspaces : null
+          runBuild(cfg, { scope, wsAllow, reason: '按需' }).catch(() => {})
+        }
         return {
           found: false,
           sessions: [],
           fallback_menu: [],
-          note: st.busy || buildPromise
+          note: building
             ? '索引正在后台建立（第一次要几分钟），稍后再问一次。'
             : `还没有索引。已让插件在后台开始建立；若长时间没有进展，检查 config.json 里的嵌入 Key（或把 provider 设为 none 只做字面）。路径：${configPath()}`,
           building: true,
+          scope: scope || null,
           stateDir: stateDir(),
         }
       }
@@ -372,6 +589,8 @@ export function apply(ctx, config) {
             return {
               time: new Date(c.t).toISOString(),
               role: c.role,
+              messageId: c.msgId || null,
+              seq: c.seq ?? null,
               text: c.text.length > 400 ? `${c.text.slice(0, 400)}…` : c.text,
             }
           }),
@@ -399,7 +618,7 @@ export function apply(ctx, config) {
       }
 
       // 没命中：给候选菜单 + 反问指引
-      const cards = cfg.daySummaries ? await loadDayCards() : {}
+      const cards = cfg.daySummaries ? await loadDayCards(scope) : {}
       const menuDays = dayMenuText(cards, days, 5)
       const menuSessions = recentMenu(loaded.meta.chunks, { days, limit: 8 })
         .filter((m) => includeActive || m.session !== undefined)
@@ -438,12 +657,75 @@ export function apply(ctx, config) {
   })
 
   // ---------------------------------------------------------------- 工具：状态
+  /** 单个库的状态（索引 + 建索引进度 + 话题卡） */
+  const statOfScope = async (scope) => {
+    const st = await indexStats(scope)
+    const bs = (await readBuildState(scope)) || currentBuildState(scope)
+    const cards = await loadDayCards(scope)
+    // 覆盖天数 / 日均块数：给前端的「体积预估」用（准确值，不靠拍脑袋）
+    let coverageDays = 0
+    let perDayChunks = 0
+    if (st.exists) {
+      const loaded = await loadIndex(scope)
+      const chunks = loaded?.meta?.chunks || []
+      if (chunks.length > 1) {
+        let lo = Infinity
+        let hi = -Infinity
+        for (const c of chunks) {
+          const t = Number(c.t) || 0
+          if (t > 0) { if (t < lo) lo = t; if (t > hi) hi = t }
+        }
+        if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
+          coverageDays = +(((hi - lo) / 86400000).toFixed(1))
+          perDayChunks = Math.round(chunks.length / Math.max(1, coverageDays))
+        }
+      }
+    }
+    return {
+      exists: st.exists,
+      chunks: st.exists ? st.count : 0,
+      dim: st.exists ? st.dim : 0,
+      sizeMB: st.exists ? +(st.bytes / 1048576).toFixed(1) : 0,
+      builtAt: st.exists ? st.builtAt : null,
+      indexPath: st.exists ? st.indexPath : null,
+      coverageDays,
+      perDayChunks,
+      dayCards: Object.keys(cards || {}).length,
+      building: isBuilding(scope),
+      lastBuild: {
+        phase: bs.phase, stage: bs.stage || null, progress: bs.progress ?? null,
+        lastBuildAt: bs.lastBuildAt || null, error: bs.error || null, errorHint: bs.errorHint || null,
+        durationMs: bs.durationMs || null, added: bs.added ?? null,
+      },
+    }
+  }
+
   const statusOf = async () => {
     const cfg = liveCfg()
     const eff = effectiveCfg(cfg)
-    const stats = await indexStats()
-    const st = (await readBuildState()) || currentBuildState()
-    const cards = await loadDayCards()
+    const sources = parseSources(cfg.sources)
+    const perSource = []
+    for (const s of sources) {
+      const st = await statOfScope(s.id)
+      perSource.push({
+        id: s.id,
+        name: s.name,
+        workspaces: s.workspaces,
+        workspacesPretty: s.workspaces.map((w) => prettyWorkspace(w)),
+        index: st.exists
+          ? { chunks: st.chunks, dim: st.dim, sizeMB: st.sizeMB, builtAt: st.builtAt, path: st.indexPath }
+          : null,
+        coverageDays: st.coverageDays,
+        perDayChunks: st.perDayChunks,
+        dayCards: st.dayCards,
+        building: st.building,
+        lastBuild: st.lastBuild,
+      })
+    }
+    const legacy = sources.length ? null : await statOfScope(null)
+    const legacyIndex = legacy && legacy.exists
+      ? { chunks: legacy.chunks, dim: legacy.dim, sizeMB: legacy.sizeMB, builtAt: legacy.builtAt, path: legacy.indexPath }
+      : null
     return {
       enabled: cfg.enabled,
       provider: normalizeProvider(cfg.provider),
@@ -452,17 +734,19 @@ export function apply(ctx, config) {
       model: cfg.model || '(默认)',
       indexDays: cfg.indexDays,
       excludeWorkspaces: cfg.excludeWorkspaces || '(无)',
-      index: stats.exists ? {
-        chunks: stats.count, dim: stats.dim, model: stats.model, provider: normalizeProvider(stats.provider),
-        builtAt: stats.builtAt, sizeMB: +(stats.bytes / 1048576).toFixed(1), path: stats.indexPath,
-      } : null,
-      building: Boolean(buildPromise) || st.phase === 'building',
-      lastBuild: {
-        phase: st.phase, stage: st.stage || null, progress: st.progress ?? null,
-        lastBuildAt: st.lastBuildAt || null, error: st.error || null, errorHint: st.errorHint || null,
-        durationMs: st.durationMs || null, added: st.added ?? null,
-      },
-      dayCards: Object.keys(cards || {}).length,
+      sources: perSource,
+      // 兼容字段（老客户端 / 单源）：第一源
+      source: perSource[0]
+        ? { id: perSource[0].id, name: perSource[0].name, workspaces: perSource[0].workspaces, workspacesPretty: perSource[0].workspacesPretty }
+        : null,
+      index: sources.length ? (perSource[0]?.index || null) : legacyIndex,
+      building: sources.length ? perSource.some((p) => p.building) : Boolean(legacy?.building),
+      lastBuild: sources.length
+        ? (perSource[0]?.lastBuild || { phase: 'idle' })
+        : (legacy?.lastBuild || { phase: 'idle' }),
+      dayCards: sources.length
+        ? perSource.reduce((a, p) => a + (p.dayCards || 0), 0)
+        : (legacy?.dayCards || 0),
       llm: llmDebug(),
       stateDir: stateDir(),
       configPath: configPath(),
@@ -496,6 +780,8 @@ export function apply(ctx, config) {
       model: { type: 'string', description: '嵌入模型；留空字符串=用默认' },
       indexDays: { type: 'number', description: '索引最近多少天（1~365）' },
       excludeWorkspaces: { type: 'string', description: '不索引的工作区（逗号分隔的目录名子串）；空字符串=全部索引' },
+      allowFromWorkspaces: { type: 'string', description: '人格隔离：只允许这些工作区里发起的会话调用检索（目录名子串，逗号分隔）；空字符串=不限制' },
+      sources: { type: 'string', description: '源工作区：JSON 数组字符串，每项 { id, name, workspaces:[会话目录名] }；空字符串=关闭源隔离（回到全部工作区）' },
       summaryModel: { type: 'string', description: '话题卡用的 Ollama 模型名' },
       daySummaries: { type: 'boolean', description: '每日话题卡开关' },
       autoIndex: { type: 'boolean', description: '自动增量索引开关' },
@@ -517,6 +803,12 @@ export function apply(ctx, config) {
         patch.indexDays = n
       }
       if (typeof a.excludeWorkspaces === 'string') patch.excludeWorkspaces = a.excludeWorkspaces
+      if (typeof a.allowFromWorkspaces === 'string') patch.allowFromWorkspaces = a.allowFromWorkspaces
+      if (typeof a.sources === 'string') {
+        const s = a.sources.trim()
+        if (s) JSON.parse(s) // 非法 JSON 直接抛，让调用方拿到明确错误
+        patch.sources = s
+      }
       if (typeof a.summaryModel === 'string' && a.summaryModel) patch.summaryModel = a.summaryModel
       if (typeof a.daySummaries === 'boolean') patch.daySummaries = a.daySummaries
       if (typeof a.autoIndex === 'boolean') patch.autoIndex = a.autoIndex
@@ -543,7 +835,7 @@ export function apply(ctx, config) {
         configPath: configPath(),
         note: [
           '配置已生效' + settingsNote,
-          patch.excludeWorkspaces !== undefined || patch.provider !== undefined || patch.model !== undefined
+          patch.excludeWorkspaces !== undefined || patch.provider !== undefined || patch.model !== undefined || patch.sources !== undefined
             ? '索引会在下一次自动检查时重建（或调 session_recall_reindex 立即重建）。'
             : '',
         ].filter(Boolean).join(' '),
@@ -560,9 +852,11 @@ export function apply(ctx, config) {
     },
     async execute(args) {
       const cfg = liveCfg()
-      if (buildPromise) return { ok: false, note: '已经有一个建索引任务在跑了，等它结束。' }
-      runBuild(cfg, { force: Boolean(args?.force), reason: '手动' }).catch(() => {})
-      return { ok: true, started: true, note: '已在后台开始重建；完成后用 session_recall_status 看结果。' }
+      const r = rebuildAll(cfg, { force: Boolean(args?.force), reason: '手动' })
+      if (!r.started.length) {
+        return { ok: false, note: `没有可重建的库（正在建：${r.skipped.join(' / ') || '无'}）。` }
+      }
+      return { ok: true, started: true, sources: r.started, note: `已在后台重建：${r.started.join(' / ')}；完成后用 session_recall_status 看结果。` }
     },
   })
 
@@ -597,10 +891,13 @@ export function apply(ctx, config) {
     return {
       enabled: c.enabled, provider: normalizeProvider(c.provider), apiBase: c.apiBase, localBase: c.localBase, model: c.model,
       indexDays: c.indexDays, excludeWorkspaces: c.excludeWorkspaces,
+      allowFromWorkspaces: c.allowFromWorkspaces,
+      sources: parseSources(c.sources),
       daySummaries: c.daySummaries, summaryModel: c.summaryModel, autoIndex: c.autoIndex,
       apiKeySet: Boolean(String(c.apiKey || '').trim()),
     }
   }
+  // sources 不在这里：改名不该重建，只有「工作区归属」变了才重建（下面单独判断）
   const REBUILD_KEYS = ['provider', 'model', 'apiBase', 'apiKey', 'indexDays', 'excludeWorkspaces']
 
   /** 列出 DSH 里所有工作区（= sessions 下的一级目录），带会话数、已索引块数、是否被排除 */
@@ -612,12 +909,20 @@ export function apply(ctx, config) {
       dirs = ents.filter((d) => d.isDirectory()).map((d) => d.name)
     } catch { return [] }
 
-    const loaded = await loadIndex()
-    const chunks = new Map()
-    for (const c of loaded?.meta.chunks || []) chunks.set(c.ws, (chunks.get(c.ws) || 0) + 1)
-
     const cfg = liveCfg()
     const ex = String(cfg.excludeWorkspaces || '').split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
+    const sources = parseSources(cfg.sources)
+    // 块数按「所有库」聚合（一个工作区只会属于一个源，不会重复计数）
+    const chunks = new Map()
+    const addChunks = (loaded) => {
+      for (const c of loaded?.meta?.chunks || []) chunks.set(c.ws, (chunks.get(c.ws) || 0) + 1)
+    }
+    if (sources.length) {
+      for (const s of sources) addChunks(await loadIndex(s.id))
+    } else {
+      addChunks(await loadIndex(null))
+    }
+    const src = sources[0] || null
     const out = []
     for (const dir of dirs) {
       let sessions = 0
@@ -631,12 +936,17 @@ export function apply(ctx, config) {
           } catch { /* 没有会话文件 */ }
         }
       } catch { /* 目录读不了 */ }
+      const owner = sources.find((s) => s.workspaces.includes(dir)) || null
+      const excluded = ex.some((s) => dir.includes(s))
       out.push({
         dir,
         label: prettyWorkspace(dir),
         sessions,
         chunks: chunks.get(dir) || 0,
-        indexed: !ex.some((s) => dir.includes(s)),
+        excluded,
+        indexed: !excluded,
+        assignedTo: owner ? owner.id : null,
+        inSource: src ? src.workspaces.includes(dir) : null,
       })
     }
     out.sort((a, b) => b.sessions - a.sessions || b.chunks - a.chunks)
@@ -651,12 +961,49 @@ export function apply(ctx, config) {
     if (req.method === 'GET' && p === '/workspaces') {
       return sendJson(res, 200, { ok: true, workspaces: await listWorkspaces() })
     }
+    // 列出本机 Ollama 已下载的模型（给「每日话题卡 → 本地模型」当选择器用）
+    if (req.method === 'GET' && p === '/ollama-models') {
+      const cfg = liveCfg()
+      const base = String(cfg.localBase || 'http://127.0.0.1:11434').replace(/\/+$/, '')
+      try {
+        const r = await fetch(`${base}/api/tags`, { signal: AbortSignal.timeout(5000) })
+        if (!r.ok) return sendJson(res, 200, { ok: false, base, error: `Ollama 返回 HTTP ${r.status}` })
+        const d = await r.json()
+        const models = (d.models || [])
+          .map((m) => ({
+            name: m.name || m.model,
+            sizeGB: m.size ? +(m.size / 1073741824).toFixed(1) : null,
+            modified: m.modified_at || null,
+          }))
+          .filter((m) => m.name)
+        return sendJson(res, 200, { ok: true, base, models })
+      } catch (e) {
+        return sendJson(res, 200, {
+          ok: false,
+          base,
+          error: String(e?.message || e).slice(0, 160),
+        })
+      }
+    }
     if (req.method === 'POST' && p === '/config') {
       const body = await readJsonBody(req)
       const patch = (body && typeof body.patch === 'object' && body.patch) || {}
       const clean = {}
-      for (const k of ['provider', 'apiBase', 'localBase', 'model', 'excludeWorkspaces', 'summaryModel']) {
+      for (const k of ['provider', 'apiBase', 'localBase', 'model', 'excludeWorkspaces', 'allowFromWorkspaces', 'summaryModel']) {
         if (typeof patch[k] === 'string') clean[k] = patch[k]
+      }
+      // 源工作区：只接受 JSON 字符串（数组）；空串 = 关闭源隔离（回到全部工作区）
+      if (typeof patch.sources === 'string') {
+        const s = patch.sources.trim()
+        if (s) {
+          try {
+            const arr = JSON.parse(s)
+            if (!Array.isArray(arr)) return sendJson(res, 400, { ok: false, error: 'sources 必须是 JSON 数组' })
+          } catch {
+            return sendJson(res, 400, { ok: false, error: 'sources 不是合法 JSON' })
+          }
+        }
+        clean.sources = s
       }
       if (patch.indexDays !== undefined) clean.indexDays = Math.max(1, Math.min(Number(patch.indexDays) || 7, 365))
       for (const k of ['daySummaries', 'autoIndex', 'enabled']) {
@@ -668,6 +1015,12 @@ export function apply(ctx, config) {
       }
       if (!Object.keys(clean).length) return sendJson(res, 400, { ok: false, error: '没有可写的字段' })
 
+      // 源只改了名字不算「设置变更」，改工作区归属才需要重建
+      const wsMapping = (raw) => parseSources(raw)
+        .map((s) => s.workspaces.slice().sort().join(','))
+        .join('|')
+      const srcChanged = clean.sources !== undefined && wsMapping(liveCfg().sources) !== wsMapping(clean.sources)
+
       await writeLocalConfig(clean)
       // 顺手同步到宿主设置层（这个版本可能不落盘，失败不影响）
       try {
@@ -675,21 +1028,29 @@ export function apply(ctx, config) {
         if (row && typeof ctx.settings?.update === 'function') await ctx.settings.update(row.ns, clean, row.revision)
       } catch { /* 已知不落盘，忽略 */ }
 
-      const needRebuild = Object.keys(clean).some((k) => REBUILD_KEYS.includes(k))
-      if (needRebuild && !buildPromise) {
-        runBuild(liveCfg(), { reason: '设置变更' }).catch(() => {})
+      const needRebuild = Object.keys(clean).some((k) => REBUILD_KEYS.includes(k)) || srcChanged
+      let rebuildStarted = []
+      if (needRebuild) {
+        rebuildStarted = rebuildAll(liveCfg(), { reason: '设置变更' }).started
       }
       return sendJson(res, 200, {
-        ok: true, rebuild: needRebuild,
+        ok: true, rebuild: needRebuild, rebuildSources: rebuildStarted,
         config: publicCfg(),
         status: await statusOf(),
       })
     }
     if (req.method === 'POST' && p === '/reindex') {
       const body = await readJsonBody(req)
-      if (buildPromise) return sendJson(res, 200, { ok: false, note: '已经有重建任务在跑，稍等它结束。' })
-      runBuild(liveCfg(), { force: Boolean(body?.force), reason: '页面手动' }).catch(() => {})
-      return sendJson(res, 200, { ok: true, note: body?.force ? '已开始全量重建（会重新嵌入全部块）' : '已开始增量更新' })
+      const r = rebuildAll(liveCfg(), { force: Boolean(body?.force), reason: '页面手动', only: String(body?.source || '') })
+      return sendJson(res, 200, {
+        ok: r.started.length > 0,
+        sources: r.started,
+        note: r.started.length
+          ? (body?.force
+            ? `已开始全量重建：${r.started.join(' / ')}（会重新嵌入全部块）`
+            : `已开始增量更新：${r.started.join(' / ')}`)
+          : `没有可重建的库（正在建：${r.skipped.join(' / ') || '无'}）`,
+      })
     }
     return sendJson(res, 404, { ok: false, error: `未知接口 ${req.method} ${p}` })
   }

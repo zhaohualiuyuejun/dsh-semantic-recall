@@ -97,6 +97,12 @@ window.__ModuleLoader__.load({
       const [key, setKey] = React.useState('')
       const [msg, setMsg] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
+      const [curId, setCurId] = React.useState('')
+      // 源名的编辑草稿：null = 没在编辑（显示已保存的名字）。
+      // 不能在 onChange 里直接改 cfg，否则失焦时「新值 == 新值」会被判成没改过、跳过保存。
+      const [nameDraft, setNameDraft] = React.useState(null)
+      // 本机 Ollama 检测结果：null=没检测过；{ok,base,models[],error}
+      const [ollama, setOllama] = React.useState(null)
 
       const load = React.useCallback(async () => {
         try {
@@ -153,27 +159,123 @@ window.__ModuleLoader__.load({
         save({ excludeWorkspaces: exclude }, '工作区选择已保存，索引会在下次检查时同步')
       }
 
+      // ── 源工作区（多源，源之间互斥；单个源可包含任意工作区）──────
+      const srcList = Array.isArray(cfg?.sources) ? cfg.sources : []
+      const curIdResolved = curId || (srcList[0] ? srcList[0].id : '')
+      const src = srcList.find((s) => s.id === curIdResolved) || null
+
+      const saveSources = async (arr, okText) => {
+        await save({ sources: JSON.stringify(arr) }, okText)
+        loadWs()
+      }
+      const addSource = () => {
+        if (busy) return
+        const id = 'src' + Date.now().toString(36)
+        setNameDraft(null)
+        setCurId(id)
+        saveSources([...srcList, { id, name: '新源', workspaces: [] }], '已新建源：现在勾选属于它的工作区')
+      }
+      const removeSource = () => {
+        if (busy || !src) return
+        const next = srcList.filter((s) => s.id !== src.id)
+        setNameDraft(null)
+        setCurId(next[0] ? next[0].id : '')
+        saveSources(next, next.length ? '已移除该源' : '已移除所有源：回到「全部工作区」模式')
+      }
+      const renameSource = (name) => {
+        if (!src) return
+        const clean = String(name || '').trim() || '未命名源'
+        if (clean === src.name) return
+        saveSources(srcList.map((s) => (s.id === src.id ? { ...s, name: clean } : s)))
+      }
+      const toggleWsInSource = (row) => {
+        if (!src) return
+        const has = src.workspaces.includes(row.dir)
+        const workspaces = has ? src.workspaces.filter((x) => x !== row.dir) : [...src.workspaces, row.dir]
+        saveSources(
+          srcList.map((s) => (s.id === src.id ? { ...s, workspaces } : s)),
+          workspaces.length ? '源工作区已更新，正在重建索引' : '该源已清空（空源不建索引）',
+        )
+      }
+
+      /** 检测本机 Ollama：列出已下载的对话模型，点一下就能填 */
+      const detectOllama = async () => {
+        setBusy(true)
+        setMsg(null)
+        try {
+          const d = await jget('/ollama-models')
+          setOllama(d)
+          if (!d.ok) setMsg({ kind: 'warn', text: `连不上 Ollama（${d.base}）：${d.error}` })
+          else if (!d.models?.length) setMsg({ kind: 'warn', text: 'Ollama 在线，但里面还没有对话模型。' })
+        } catch (e) {
+          setMsg({ kind: 'err', text: '检测失败：' + e.message })
+        } finally { setBusy(false) }
+      }
+
       if (!st || !cfg) {
         return h('div', { 'data-sr-root': '' }, h('div', { 'data-sr-note': '' }, '读取中…'))
       }
 
-      const idx = st.index
-      const b = st.lastBuild || {}
-      const building = st.building || b.phase === 'building'
+      const curStat = src && Array.isArray(st.sources) ? st.sources.find((s) => s.id === src.id) : null
+      const idx = (src ? curStat?.index : st.index) || null
+      const b = (src ? curStat?.lastBuild : st.lastBuild) || {}
+      const building = src ? Boolean(curStat?.building) : Boolean(st.building)
       const prog = typeof b.progress === 'number' ? Math.round(b.progress * 100) : null
       const mode = cfg.provider
+      const dayCardCount = src ? (curStat?.dayCards || 0) : (st.dayCards || 0)
 
       return h('div', { 'data-sr-root': '' },
+
+        // ── 源工作区（多源：源之间互斥，单个源可含任意工作区）──────
+        h('div', { 'data-sr-sec': '' },
+          h('div', { 'data-sr-row': '' },
+            h('div', { 'data-sr-h': '' }, '源工作区'),
+            h('select', {
+              'data-sr-in': '', style: { flex: '0 0 auto', minWidth: '200px' },
+              value: src ? src.id : '',
+              onChange: (e) => { setCurId(e.target.value); setNameDraft(null) },
+              disabled: busy || !srcList.length,
+            },
+              srcList.length
+                ? srcList.map((s) => h('option', { key: s.id, value: s.id }, s.name))
+                : h('option', { value: '' }, '未设置（全部工作区）'),
+            ),
+            h('button', { 'data-sr-btn': '', disabled: busy, onClick: addSource }, '＋ 添加源工作区'),
+            src
+              ? h('button', { 'data-sr-btn': '', 'data-ghost': '1', disabled: busy, onClick: removeSource }, '移除当前源')
+              : null,
+          ),
+          src
+            ? h('div', { 'data-sr-row': '' },
+              h('span', { 'data-sr-label': '' }, '源名称'),
+              h('input', {
+                'data-sr-in': '', value: nameDraft !== null ? nameDraft : src.name, style: { maxWidth: '220px' },
+                onChange: (e) => setNameDraft(e.target.value),
+                onBlur: () => {
+                  const v = nameDraft
+                  setNameDraft(null)
+                  if (v !== null) renameSource(v)
+                },
+              }),
+            )
+            : null,
+          h('div', { 'data-sr-note': '' }, src
+            ? `「${src.name}」包含 ${src.workspaces.length} 个工作区；只有它们会建索引、可检索。一个工作区只能归一个源。`
+            : (srcList.length
+              ? '当前源还是空的（空源不建索引）：在下面的列表里勾选属于它的工作区。'
+              : '未设置源：沿用旧行为（全部工作区共用一个库）。点「＋ 添加源工作区」开始分源。')),
+        ),
 
         // ── 状态 ──────────────────────────────────────────────
         h('div', { 'data-sr-sec': '' },
           h('div', { 'data-sr-h': '' }, '状态'),
           h('div', { 'data-sr-card': '' },
+            h('div', {}, h('div', { 'data-sr-k': '' }, '源'), h('div', { 'data-sr-v': '' }, src ? src.name : '全部')),
             h('div', {}, h('div', { 'data-sr-k': '' }, '索引块数'), h('div', { 'data-sr-v': '' }, idx ? String(idx.chunks) : '无')),
             h('div', {}, h('div', { 'data-sr-k': '' }, '维度'), h('div', { 'data-sr-v': '' }, idx && idx.dim ? String(idx.dim) : '—')),
             h('div', {}, h('div', { 'data-sr-k': '' }, '体积'), h('div', { 'data-sr-v': '' }, idx ? `${idx.sizeMB} MB` : '—')),
             h('div', {}, h('div', { 'data-sr-k': '' }, '建于'), h('div', { 'data-sr-v': '' }, idx && idx.builtAt ? String(idx.builtAt).slice(5, 16).replace('T', ' ') : '—')),
-            h('div', {}, h('div', { 'data-sr-k': '' }, '话题卡'), h('div', { 'data-sr-v': '' }, `${st.dayCards || 0} 天`)),
+            h('div', {}, h('div', { 'data-sr-k': '' }, '话题卡'), h('div', { 'data-sr-v': '' }, `${dayCardCount} 天`)),
             h('div', {}, h('div', { 'data-sr-k': '' }, '检索方式'), h('div', { 'data-sr-v': '' },
               st.providerEffective === 'none' ? '字面' : st.providerEffective === 'cloud' ? '云端语义' : '本地语义')),
           ),
@@ -230,14 +332,14 @@ window.__ModuleLoader__.load({
               onChange: (e) => setKey(e.target.value),
             }), '只写在本机的配置文件里，不会出现在对话中'),
             h('div', { 'data-sr-row': '' },
-              h('button', { 'data-sr-btn': '', disabled: busy || !key.trim(), onClick: () => save({ apiKey: key.trim() }, 'API Key 已保存') }, '保存 Key'),
+              h('button', { 'data-sr-btn': '', disabled: busy || !key.trim(), onClick: () => save({ apiKey: key.trim() }, 'API Key 已保存（输入框会清空，这是正常的：留空 = 不改动已存的 Key）') }, '保存 Key'),
               h('button', { 'data-sr-btn': '', 'data-ghost': '1', disabled: busy || !cfg.apiKeySet, onClick: () => save({ apiKey: '' }, 'API Key 已清除') }, '清除 Key'),
             ),
             FIELD('接口地址', h('input', {
-              'data-sr-in': '', value: cfg.apiBase || '', placeholder: '任何 OpenAI 兼容的 /v1 地址（留空=内置默认）',
+              'data-sr-in': '', value: cfg.apiBase || '', placeholder: '一般留空即可（内置默认接口）',
               onChange: (e) => setCfg({ ...cfg, apiBase: e.target.value }),
               onBlur: (e) => save({ apiBase: e.target.value }),
-            }), '要求实现 /v1/embeddings'),
+            }), '一般不用填。只有换成自建的 OpenAI 兼容服务时才填；要求实现 /v1/embeddings'),
             FIELD('嵌入模型', h('input', {
               'data-sr-in': '', value: cfg.model || '', placeholder: '留空 = 内置默认模型',
               onChange: (e) => setCfg({ ...cfg, model: e.target.value }),
@@ -270,8 +372,25 @@ window.__ModuleLoader__.load({
           FIELD('索引天数', h('input', {
             'data-sr-in': '', type: 'number', min: 1, max: 365, value: cfg.indexDays,
             onChange: (e) => setCfg({ ...cfg, indexDays: Number(e.target.value) }),
-            onBlur: (e) => save({ indexDays: Number(e.target.value) }),
-          }), '默认 7 天；想搜「上周」建议 14'),
+            onBlur: (e) => {
+              const n = Math.max(1, Math.min(Number(e.target.value) || 7, 365))
+              setCfg({ ...cfg, indexDays: n })
+              save({ indexDays: n })
+            },
+          }), '默认 7 天；想搜「上周」建议 14；30 天以内最稳，365 是硬上限'),
+          // 体积预估：用实测日均块数算，不靠拍脑袋
+          (() => {
+            const perDay = curStat?.perDayChunks || 0
+            const dimNow = idx?.dim || 4096
+            const days = Math.max(1, Math.min(Number(cfg.indexDays) || 7, 365))
+            if (!perDay) return null
+            const estChunks = Math.round(perDay * days)
+            const estMB = Math.max(1, Math.round((estChunks * dimNow * 4) / 1048576))
+            const warn = days > 90
+            return h('div', { 'data-sr-note': '', style: warn ? { color: '#ffd479' } : null },
+              `按当前对话量（日均 ${perDay} 块）估算：${days} 天 ≈ ${estChunks} 块 / 约 ${estMB} MB`
+              + (warn ? '。⚠️ 超过 90 天体积会明显变大，首次重建也更久。' : ''))
+          })(),
           h('div', { 'data-sr-row': '' },
             h('span', { 'data-sr-label': '' }, '自动增量'),
             h('button', {
@@ -280,19 +399,31 @@ window.__ModuleLoader__.load({
             }),
             h('span', { 'data-sr-note': '' }, '启动时 + 每 6 小时检查一次'),
           ),
-          h('div', { 'data-sr-row': '' }, h('span', { 'data-sr-label': '' }, '索引哪些工作区')),
+          h('div', { 'data-sr-row': '' }, h('span', { 'data-sr-label': '' }, src ? '本源包含的工作区' : '索引哪些工作区')),
           ws.length
             ? h('div', { 'data-sr-ws': '' },
-              ...ws.map((w) => h('div', {
-                'data-sr-wsr': '', 'data-off': w.indexed ? '0' : '1',
-                onClick: () => !busy && toggleWs(w),
-              },
-              h('span', { 'data-sr-ck': '', 'data-on': w.indexed ? '1' : '0' }, w.indexed ? '✓' : ''),
-              h('span', { 'data-sr-wsl': '', title: w.label }, w.label),
-              h('span', { 'data-sr-wsn': '' }, `${w.sessions} 场${w.chunks ? ` · 已索引 ${w.chunks} 块` : ''}`),
-              )))
+              ...ws.map((w) => {
+                const other = src && w.assignedTo && w.assignedTo !== src.id
+                const ownerName = other ? ((srcList.find((s) => s.id === w.assignedTo) || {}).name || '别的源') : ''
+                const on = src ? Boolean(w.assignedTo === src.id) : Boolean(w.indexed)
+                const meta = [
+                  String(w.sessions) + ' 场',
+                  w.chunks ? '已索引 ' + w.chunks + ' 块' : '',
+                ].filter(Boolean).join(' · ')
+                return h('div', {
+                  'data-sr-wsr': '', 'data-off': on ? '0' : '1',
+                  style: other ? { opacity: '.35', cursor: 'default' } : null,
+                  onClick: () => { if (busy || other) return; if (src) toggleWsInSource(w); else toggleWs(w) },
+                },
+                h('span', { 'data-sr-ck': '', 'data-on': on ? '1' : '0' }, on ? '✓' : ''),
+                h('span', { 'data-sr-wsl': '', title: w.label }, w.label),
+                h('span', { 'data-sr-wsn': '' }, other ? '已被「' + ownerName + '」占用' : meta),
+                )
+              }))
             : h('div', { 'data-sr-note': '' }, '还没读到工作区（索引建好后就会出现）'),
-          h('div', { 'data-sr-note': '' }, '勾上 = 索引；取消 = 不索引（隐私）。新出现的工作区默认是勾上的。'),
+          h('div', { 'data-sr-note': '' }, src
+            ? '勾上 = 加入本源并建立索引；取消 = 移出本源并停止索引。一个工作区只能归入一个源，已被别的源占用的不能勾。'
+            : '勾上 = 索引；取消 = 不索引（隐私）。新出现的工作区默认是勾上的。'),
         ),
 
         // ── 话题卡 ────────────────────────────────────────────
@@ -306,14 +437,37 @@ window.__ModuleLoader__.load({
             }),
             h('span', { 'data-sr-note': '' }, '每天 3~5 个话题，用于「想不起来关键词」时给你挑'),
           ),
-          FIELD('本地模型', h('input', {
-            'data-sr-in': '', value: cfg.summaryModel || '', placeholder: '留空 = 用 DSH 当前的模型总结',
-            onChange: (e) => setCfg({ ...cfg, summaryModel: e.target.value }),
-            onBlur: (e) => save({ summaryModel: e.target.value }),
-          }), '留空：走 DSH 自己的模型（会消耗额度）；填了：只用本机 Ollama 的这个模型（不出网）'),
+          FIELD('本地模型', h('div', { style: { display: 'flex', gap: '8px', flex: '1', minWidth: '180px' } },
+            h('input', {
+              'data-sr-in': '', value: cfg.summaryModel || '', placeholder: '例如 qwen3:8b（Ollama 里已下载的对话模型）',
+              onChange: (e) => setCfg({ ...cfg, summaryModel: e.target.value }),
+              onBlur: (e) => save({ summaryModel: e.target.value }),
+            }),
+            h('button', {
+              'data-sr-btn': '', 'data-ghost': '1', disabled: busy,
+              onClick: detectOllama,
+            }, '检测 Ollama'),
+          ), '填 Ollama 已下载的【对话模型】名（不是上方「本地」那个嵌入模型）。留空 = 用 DSH 当前模型（消耗额度）；填了 = 只用本机 Ollama，不出网、免费。'),
+          ollama
+            ? h('div', { 'data-sr-sec': '' },
+              ollama.ok
+                ? (ollama.models?.length
+                  ? h('div', { 'data-sr-row': '' },
+                    h('span', { 'data-sr-label': '' }, '可用模型'),
+                    ...ollama.models.map((m) => h('button', {
+                      key: m.name,
+                      'data-sr-btn': '', 'data-ghost': '1', disabled: busy,
+                      onClick: () => { save({ summaryModel: m.name }, `已选 ${m.name}，下一轮生成话题卡时生效`); setOllama(null) },
+                    }, m.name + (m.sizeGB ? `（${m.sizeGB}GB）` : ''))),
+                  )
+                  : h('div', { 'data-sr-note': '' }, `Ollama 在线（${ollama.base}），但还没下载对话模型。`))
+                : h('div', { 'data-sr-note': '' }, `连不上 Ollama（${ollama.base}）：${ollama.error}。先启动 Ollama，或留空用 DSH 模型。`),
+            )
+            : null,
         ),
 
         msg ? h('div', { 'data-sr-msg': '', 'data-kind': msg.kind }, msg.text) : null,
+        h('div', { 'data-sr-note': '' }, '索引文件：' + (idx?.path || '（还没有索引）')),
         h('div', { 'data-sr-note': '' }, '配置存在本机：' + (st.configPath || '')),
       )
     }
