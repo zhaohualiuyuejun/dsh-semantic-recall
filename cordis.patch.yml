@@ -1,0 +1,10 @@
+# dsh-semantic-recall —— 插件自带的挂载声明
+# 装上之后，profile 的 dsh.profile.bundles 里列出本包名即生效。
+- insert:
+    - id: session-recall
+      name: dsh-semantic-recall
+      config:
+        # 默认值；用户能在插件自己的设置页里改（写 $DSH_HOME/session-recall/config.json）
+        enabled: true
+        provider: cloud
+        indexDays: 7
