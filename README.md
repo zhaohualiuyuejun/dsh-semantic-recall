@@ -14,17 +14,16 @@
 
 ## 一键安装
 
-**方式 A：把这段话贴给 DSH 里的 AI（最省事）**
+**方式 A：把这段话贴给 DSH 里的 AI（最省事，走 npm）**
 
-> 用 plugin_manager 执行 `install_bundle`，target 填
-> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz`，
+> 用 plugin_manager 执行 `install_bundle`，target 填 `dsh-semantic-recall`，
 > 装完提醒我刷新页面。
 
 **方式 B：自己执行**（创造模式）
 
 ```
 action: install_bundle
-target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz
+target: dsh-semantic-recall
 ```
 
 **方式 C：从源码目录装**
@@ -36,7 +35,11 @@ git clone https://github.com/zhaohualiuyuejun/dsh-semantic-recall.git
 
 三种方式等价，装完 **刷新一次页面**，左侧「设置」里出现「会话语义检索」即成功。
 **不需要 Node 依赖、不需要手改 profile**（bundle 自带 cordis patch）。
-装好后的开启步骤见下面「安装」第 3～4 步。
+
+> 网络到不了 npm registry 时，用 GitHub Release 的 tgz 兜底（装法与包名相同，target 换成下面这个地址）：
+> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz`
+>
+> 装好后的开启步骤见下面「安装」第 3～4 步。
 
 ---
 
@@ -351,22 +354,26 @@ $DSH_HOME/session-recall/config.json      # Windows: C:\Users\<你>\.dsh\session
 
 ## 安装（给第一次用的人）
 
-> **现状（2026-11-01）**：npm 上暂未发布——npm 已关闭命令行建号，网页注册又被反爬拦住了。
-> 现在用 **GitHub Release** 分发（最新 **v0.2.5**）：
+> **现状（2026-11-01）**：**已发布到 npm**（包名 `dsh-semantic-recall`，当前 **0.2.5**）。
+> 安装时 `target` 直接填包名，pnpm 会从 registry 取最新版：
 >
 > ```
 > action: install_bundle
-> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz
+> target: dsh-semantic-recall
 > ```
 >
-> 发布到 npm 之后，`target` 直接填包名 `dsh-semantic-recall` 即可（见顶部「一键安装」）。
+> 网络到不了 npm registry 时，用 **GitHub Release** 的 tgz 兜底
+> （`https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz`）。
+> 也可以用**源码目录**装，适合想改代码的人。
 
 ### 1. 把包放进机器
 
 ```bash
-# 发布到 npm 之后（推荐）：plugin_manager 的 target 直接填包名
+# 推荐：什么都不用下载，plugin_manager 的 target 直接填包名
 #   target: dsh-semantic-recall
-# 现在（未发布）：clone / 拷目录，用本地路径装
+
+# 兜底 A（npm 不可达）：下载 GitHub Release 的 tgz，把它的绝对路径填进 target
+# 兜底 B（想改代码）：clone 源码目录，把目录绝对路径填进 target
 git clone <这个仓库>
 # 目录里应当有 package.json / cordis.patch.yml / index.js / client.js / lib/
 ```
@@ -443,33 +450,37 @@ target: <上面那个目录的绝对路径>
 
 ## 升级（从旧版换到新版，务必先看）
 
-### 1. 先备份当前插件目录
+> **用包名升级（推荐）**：`action: install_bundle` + `target: dsh-semantic-recall`，pnpm 从 registry 取新版，**下面 1~3 条的坑都不存在**。
+> 1~3 条只针对用 `file:` / tgz 路径安装的情况。
+
+### 1. 先备份当前插件目录（仅 `file:` / tgz 安装需要）
 
 用 tgz 覆盖安装时，pnpm 会把依赖源**追平成真实目录**：
 如果你的 `package.json` 里写的是 `"dsh-semantic-recall": "file:E:/某个目录"`，
 那个源目录**会被清空**（profile 里拿到的是真实副本，源目录被收走）。
 **升级前先 zip 备份一份**，或确认它本来就来自 registry。
 
-### 2. tgz 放到不会被清理的固定目录再装
+### 2. tgz 放到不会被清理的固定目录再装（仅 tgz 安装需要）
 
-装完依赖会记成**绝对路径**，例如：
+用 tgz 装完，依赖会记成**绝对路径**，例如：
 
 ```json
 "dsh-semantic-recall": "file:E:/QQBot/packages/dsh-semantic-recall-0.2.2.tgz"
 ```
 
 把 tgz 放在临时目录，之后一清理，下一次 `pnpm` 解析依赖就会失败。
-建议固定放 `~/dsh-packages/` 这类目录。
+建议固定放 `~/dsh-packages/` 这类目录；**用包名安装则没有这个问题**。
 
 ### 3. `installBundle` 的 `spec` 是**字符串**，而且不会预校验
 
 ```
 action: install_bundle
-target: <绝对路径 / tgz 路径 / 包名>   ← 都是字符串
+target: <包名 / 绝对路径 / tgz 路径>   ← 都是字符串
 ```
 
 传对象会报 `wire field spec` 失败。另外它**不会先确认包存不存在**——
 传一个不存在的名字，pnpm 会真的去 registry 装同名包。别拿它试参数。
+最省事、最不容易错的写法就是填包名 `dsh-semantic-recall`。
 
 ### 4. 升级后必须**全量重建**（`force: true`），不是可选项
 

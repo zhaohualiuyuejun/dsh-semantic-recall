@@ -11,6 +11,14 @@
     "./icon": "./icon.svg"
   },
   "description": "换新对话也不失忆：跨工作区索引最近 N 天的对话，用一句模糊描述召回过去的话题与原话；不确定时会反问而不是硬编（自带设置页）",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhaohualiuyuejun/dsh-semantic-recall.git"
+  },
+  "homepage": "https://github.com/zhaohualiuyuejun/dsh-semantic-recall#readme",
+  "bugs": {
+    "url": "https://github.com/zhaohualiuyuejun/dsh-semantic-recall/issues"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
