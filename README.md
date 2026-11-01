@@ -17,14 +17,14 @@
 **方式 A：把这段话贴给 DSH 里的 AI（最省事）**
 
 > 用 plugin_manager 执行 `install_bundle`，target 填
-> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.2/dsh-semantic-recall-0.2.2.tgz`，
+> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.3/dsh-semantic-recall-0.2.3.tgz`，
 > 装完提醒我刷新页面。
 
 **方式 B：自己执行**（创造模式）
 
 ```
 action: install_bundle
-target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.2/dsh-semantic-recall-0.2.2.tgz
+target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.3/dsh-semantic-recall-0.2.3.tgz
 ```
 
 **方式 C：从源码目录装**
@@ -170,10 +170,10 @@ session_recall({ session: "session-fe4c6d40-..." })
 
 | 工具 | 用途 |
 |---|---|
-| `session_recall` | 核心检索。参数：`query` / `days` / `role` / `max_sessions` / `include_active` |
-| `session_recall_status` | 索引多少块、建于何时、是否在建、嵌入来源是否就绪、话题卡几天 |
+| `session_recall` | 核心检索。参数：`query` / `days` / `role` / `maxSessions` / `includeActive` / `session`（也接受 `max_sessions` / `include_active` 旧写法） |
+| `session_recall_status` | 索引多少块、建于何时、是否在建、嵌入来源是否就绪、话题卡几天、嵌入是否上云 |
 | `session_recall_reindex` | 手动重建（`force=true` 全量重嵌） |
-| `session_recall_config` | 读/改设置（非密钥项） |
+| `session_recall_config` | 读/改设置（非密钥项，含 `minScore` / `midScore`） |
 
 ## 设置页（普通用户用这个，不用碰 JSON）
 
@@ -246,6 +246,9 @@ found = 非自我引用 && (
         )
 ```
 
+- **两条线可调**：`minScore`（默认 0.70）与 `midScore`（默认 0.55），改配置文件或
+  `session_recall_config { minScore: 0.65 }`。实测出现过「0.661 但确实是正确答案」被判否的情况，
+  这种时候把 `minScore` 降到 0.65 即可；**不建议低于 0.60**（假命中区间 0.475~0.616 会漏进来）。
 - **自我引用闸门**：top 块是 AI 说的话、且把问题核心串**原样复述**了一遍 ⇒ 它在「讨论这句话」而不是「回答这句话」。
   （实测：MVP 调试那场把测试问句写进了语料，「去哪吃饭」因此拿到 0.576 高分 —— 这是最伤信任的假阳性。）
 - 标定结果：15 条查询 **12 对 / 1 漏 / 0 假阳性**。漏的那条是「C盘满了怎么清理」（换了说法问、词面没对上），
@@ -259,7 +262,8 @@ found = 非自我引用 && (
   - 没有源（老模式）：`index/meta.json` + `index/vectors.f32`
   - 有源（多源）：`scopes/<源id>/index/meta.json` + `vectors.f32`
 - 只存「人话」：跳过 reasoning、工具调用/结果、系统注入、自动化会话的人设提示。
-- 云端嵌入时，只把**切好的文本块**发给 API；不出网的话把 `provider` 设成 `local` 或 `none`。
+- 云端嵌入时，只把**切好的文本块**发给 API（不发工具调用、不发推理过程）；不出网的话把 `provider` 设成 `local` 或 `none`。
+  **这件事在三处明示**：建索引日志、`session_recall_status` 的 `embedding.sendsTextToCloud` / `privacy`、设置页的检索方式。
 - `excludeWorkspaces`：逗号分隔的目录名子串，命中就不索引（例如 `dsh-bili-duty,scratch-notes`）。
 
 ## 存储与体积（会不会无限膨胀）
@@ -320,6 +324,8 @@ $DSH_HOME/session-recall/config.json      # Windows: C:\Users\<你>\.dsh\session
   "localBase": "",
   "model": "",
   "indexDays": 7,
+  "minScore": 0.7,
+  "midScore": 0.55,
   "daySummaries": true,
   "summaryModel": "",
   "autoIndex": true,
@@ -346,11 +352,11 @@ $DSH_HOME/session-recall/config.json      # Windows: C:\Users\<你>\.dsh\session
 ## 安装（给第一次用的人）
 
 > **现状（2026-11-01）**：npm 上暂未发布——npm 已关闭命令行建号，网页注册又被反爬拦住了。
-> 现在用 **GitHub Release** 分发（最新 **v0.2.2**）：
+> 现在用 **GitHub Release** 分发（最新 **v0.2.3**）：
 >
 > ```
 > action: install_bundle
-> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.2/dsh-semantic-recall-0.2.2.tgz
+> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.3/dsh-semantic-recall-0.2.3.tgz
 > ```
 >
 > 发布到 npm 之后，`target` 直接填包名 `dsh-semantic-recall` 即可（见顶部「一键安装」）。
@@ -530,6 +536,8 @@ DeepSeek 判定整批工具定义非法 ⇒ 该会话所有请求失败。**升�
 
 ## 版本
 
+- `0.2.3`（2026-11-01）：**用起来更顺手的三个改动**——① `includeActive` **默认改为 true**（旧版默认整场排除活跃会话，导致「今天上午说的那些」必定搜不到；想排除再显式传 false）；② 参数改成 **camelCase**（`maxSessions` / `includeActive`），同时**继续接受** `max_sessions` / `include_active`——以前传 camelCase 会静默少结果，现在两种都认；③ 命中门限**可配**（`minScore` 默认 0.70、`midScore` 默认 0.55），实测「0.661 但答案正确」被判否的场合可以调到 0.65。
+  另：检索结果的 `note` 里会带上**索引快照时间**（「索引快照：11:41（1 小时前）——这之后的新对话还没进索引」）；`session_recall_status` 增加 `embedding.sendsTextToCloud` 与 `privacy` 字段，明确告知云端嵌入会把**对话文本块**发到嵌入服务端；`hostDeps.defineTool` 会报 `local-fallback`（宿主工具契约再变时有迹可循）。验证脚本：`tools/verify-0.2.3.mjs`。
 - `0.2.2`（2026-11-01）：**修复两个会让人以为「DSH 坏了」的 bug**——① `lib/hostdeps.mjs` 的本地等价 `defineTool` 现在会把隐式参数表编译成 `{ type:'object', properties }` 根节点（桌面版取不到宿主 `dsh-tools` 时，旧版会让模型请求里的工具定义非法，**导致整场对话 400**）；② `lib/embed.mjs` 在嵌入前清洗落单 UTF-16 代理项（emoji 被截半），批量 400 时改为逐条重试、坏块用 `null` 占位跳过（旧版一条坏块连坐整批，表现是「切块 1608 / 0 块成功」）。README 补 bundle `enabled` 排查与设置优先级两条 FAQ。验证脚本：`tools/verify-fix-0.2.2.mjs`。
 - `0.2.1`（2026-10-31）：**源工作区隔离 + 多源分库**——每个源一个独立库（`scopes/<源>/`），按调用方工作区路由；源之间互斥，单源可含任意工作区；非源工作区直接拒绝。新增对外锚点（`session` / `messageId` / `seq`）与 `session_recall({ session })` 原文下钻；跨通道（QQ / 微信）从 `tool/call` / `tool/result` 里提取真实对话，并过滤桥接注入；索引天数实时体积预估、Ollama 一键检测、支持只重建指定源；README 补「实测数据」「设计取舍」「FAQ」「跨通道接入」「对外接口约定」。
 - `0.2.0`（2026-10-31）：**首个可对外版本**。自带设置页（界面里填 Key / 勾工作区 / 改天数 / 重建）、改名为 `dsh-semantic-recall`、嵌入改「云端 / 本地」两档、话题卡默认走 DSH 模型、判定改为「高分线 + 词面证据 + 自我引用闸门」。
