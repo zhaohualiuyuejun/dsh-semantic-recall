@@ -17,14 +17,14 @@
 **方式 A：把这段话贴给 DSH 里的 AI（最省事）**
 
 > 用 plugin_manager 执行 `install_bundle`，target 填
-> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.4/dsh-semantic-recall-0.2.4.tgz`，
+> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz`，
 > 装完提醒我刷新页面。
 
 **方式 B：自己执行**（创造模式）
 
 ```
 action: install_bundle
-target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.4/dsh-semantic-recall-0.2.4.tgz
+target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz
 ```
 
 **方式 C：从源码目录装**
@@ -352,11 +352,11 @@ $DSH_HOME/session-recall/config.json      # Windows: C:\Users\<你>\.dsh\session
 ## 安装（给第一次用的人）
 
 > **现状（2026-11-01）**：npm 上暂未发布——npm 已关闭命令行建号，网页注册又被反爬拦住了。
-> 现在用 **GitHub Release** 分发（最新 **v0.2.4**）：
+> 现在用 **GitHub Release** 分发（最新 **v0.2.5**）：
 >
 > ```
 > action: install_bundle
-> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.4/dsh-semantic-recall-0.2.4.tgz
+> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.5/dsh-semantic-recall-0.2.5.tgz
 > ```
 >
 > 发布到 npm 之后，`target` 直接填包名 `dsh-semantic-recall` 即可（见顶部「一键安装」）。
@@ -536,6 +536,7 @@ DeepSeek 判定整批工具定义非法 ⇒ 该会话所有请求失败。**升�
 
 ## 版本
 
+- `0.2.5`（2026-11-01）：`session_recall_status` 增加 **`version`** 字段（从同目录 `package.json` 读取，读不到报 `unknown`）——排查「装的到底是哪一版」时不用再翻文件。纯新增，不改变任何检索与索引行为。
 - `0.2.4`（2026-11-01）：**修正「排除范围」而不是「要不要索引当前会话」**——默认仍然不搜当前这场（它本来就在上下文里），但排除方式从「30 分钟内活跃的**所有**会话整场排除」改成「**只排除调用方自己这场**」（用 `exec.agent.session.id` 精确识别，拿不到 id 才退回旧行为）。
   修的是一个边界：自动压缩 → 归档旧会话 → 开新会话的流程里，刚归档的上一场只差几分钟，会被当成「活跃会话」整场藏起来，看起来像检索有盲区；而长期不换会话的人完全不受影响。`includeActive=true` 时连自己这场也一起搜。验证脚本：`tools/verify-0.2.4.mjs`。
 - `0.2.3`（2026-11-01）：**用起来更顺手的三个改动**——① ~~`includeActive` 默认改为 true~~（**该默认值已被 0.2.4 推翻**：会索引当前对话、带来问句回声；正确做法是只排除调用方自己这场）；② 参数改成 **camelCase**（`maxSessions` / `includeActive`），同时**继续接受** `max_sessions` / `include_active`——以前传 camelCase 会静默少结果，现在两种都认；③ 命中门限**可配**（`minScore` 默认 0.70、`midScore` 默认 0.55），实测「0.661 但答案正确」被判否的场合可以调到 0.65。

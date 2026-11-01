@@ -14,6 +14,7 @@
  */
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { readdir, stat, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { loadIndex, indexStats } from './lib/vectorstore.mjs'
 import { embedQuery, normalizeProvider } from './lib/embed.mjs'
@@ -29,6 +30,13 @@ import { copyFile, mkdir } from 'node:fs/promises'
 const hostDeps = await loadHostDeps()
 const z = hostDeps.z
 const defineTool = hostDeps.defineTool
+
+/** 插件版本：从同目录 package.json 读；读不到就报 unknown（排查版本问题时不用再翻文件） */
+const VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || 'unknown'
+  } catch { return 'unknown' }
+})()
 
 export const name = 'session-recall'
 export const inject = ['tools', 'settings', 'webServer']
@@ -787,6 +795,7 @@ export function apply(ctx, config) {
       pageApiError,
       hostDepsNotes: hostDeps.notes,
       hostDeps: { defineTool: hostDeps.defineToolKind },
+      version: VERSION,
       embedding: {
         provider: normalizeProvider(cfg.provider),
         effective: eff.provider,
