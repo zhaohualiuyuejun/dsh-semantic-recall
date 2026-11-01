@@ -12,6 +12,34 @@
 
 ---
 
+## 一键安装
+
+**方式 A：把这段话贴给 DSH 里的 AI（最省事）**
+
+> 用 plugin_manager 执行 `install_bundle`，target 填
+> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.1/dsh-semantic-recall-0.2.1.tgz`，
+> 装完提醒我刷新页面。
+
+**方式 B：自己执行**（创造模式）
+
+```
+action: install_bundle
+target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.1/dsh-semantic-recall-0.2.1.tgz
+```
+
+**方式 C：从源码目录装**
+
+```bash
+git clone https://github.com/zhaohualiuyuejun/dsh-semantic-recall.git
+# 然后把上面 clone 出来的目录绝对路径填进 install_bundle 的 target
+```
+
+三种方式等价，装完 **刷新一次页面**，左侧「设置」里出现「会话语义检索」即成功。
+**不需要 Node 依赖、不需要手改 profile**（bundle 自带 cordis patch）。
+装好后的开启步骤见下面「安装」第 3～4 步。
+
+---
+
 ## 它解决什么（以及不解决什么）
 
 | | 管什么 | 什么时候有用 |
@@ -317,15 +345,15 @@ $DSH_HOME/session-recall/config.json      # Windows: C:\Users\<你>\.dsh\session
 
 ## 安装（给第一次用的人）
 
-> **现状（2026-10-31）**：npm 上暂未发布——npm 已关闭命令行建号，网页注册又被反爬拦住了。
-> 现在用 **GitHub Release** 分发：
+> **现状（2026-11-01）**：npm 上暂未发布——npm 已关闭命令行建号，网页注册又被反爬拦住了。
+> 现在用 **GitHub Release** 分发（最新 **v0.2.1**）：
 >
 > ```
 > action: install_bundle
-> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.0/dsh-semantic-recall-0.2.0.tgz
+> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.1/dsh-semantic-recall-0.2.1.tgz
 > ```
 >
-> 发布到 npm 之后，`target` 直接填包名 `dsh-semantic-recall` 即可。
+> 发布到 npm 之后，`target` 直接填包名 `dsh-semantic-recall` 即可（见顶部「一键安装」）。
 
 ### 1. 把包放进机器
 
