@@ -420,7 +420,7 @@ export function apply(ctx, config) {
       days: { type: 'number', description: '只找最近 N 天（不填 = 用设置里的索引天数）' },
       role: { type: 'string', description: 'user=只看人说的 · assistant=只看 AI 说的 · 不填=都要' },
       maxSessions: { type: 'number', description: '最多返回几场会话（默认 3）；下钻模式下是最多返回几块（默认 20）。也接受 max_sessions' },
-      includeActive: { type: 'boolean', description: '是否包含最近 30 分钟仍在活动的会话（默认 true）。查「刚才说的那些」时保持默认；改 false 才整场排除。也接受 include_active' },
+      includeActive: { type: 'boolean', description: '是否连**当前这场对话自己**也一起搜（默认 false）。默认只排除调用方自己这场，其他最近活跃的会话照常可搜。也接受 include_active' },
       session: { type: 'string', description: '会话 id（session-xxxx）：直接下钻该会话的原文，跳过语义检索。记忆插件拿到 sourceSessionId 时用它' },
     },
     async execute(args, exec) {
@@ -532,9 +532,13 @@ export function apply(ctx, config) {
       const maxSessions = Math.max(1, Math.min(Number(args?.maxSessions ?? args?.max_sessions) || 3, 8))
       const days = Math.max(1, Math.min(Number(args?.days) || cfg.indexDays || 7, 365))
       const role = ['user', 'assistant'].includes(String(args?.role)) ? String(args.role) : undefined
-      // 默认包含活跃会话（旧版默认整场排除，导致「今天上午说的」必定搜不到）
+      // 默认：只排除调用方自己这场会话（当前对话本来就在上下文里）。
+      // 以前是「排除所有 30 分钟内活跃的会话」——自动压缩归档后开新会话的人，会搜不到刚归档的上一场。
       const includeActiveArg = args?.includeActive ?? args?.include_active
-      const includeActive = includeActiveArg === undefined ? true : Boolean(includeActiveArg)
+      const includeActive = includeActiveArg === true
+      const callerSession = String(
+        exec?.agent?.session?.id || exec?.session?.id || exec?.sessionId || '',
+      ).trim()
       // 命中门限可配（默认 0.70 / 0.55）
       const highGate = Math.max(0.4, Math.min(Number(cfg.minScore) || 0.70, 0.95))
       const midGate = Math.max(0.3, Math.min(Number(cfg.midScore) || 0.55, 0.9))
@@ -584,6 +588,7 @@ export function apply(ctx, config) {
         days,
         role,
         includeActive,
+        excludeSession: includeActive ? '' : callerSession,
         highGate,
         midGate,
         nowMs: Date.now(),
