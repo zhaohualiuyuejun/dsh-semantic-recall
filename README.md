@@ -17,14 +17,14 @@
 **方式 A：把这段话贴给 DSH 里的 AI（最省事）**
 
 > 用 plugin_manager 执行 `install_bundle`，target 填
-> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.1/dsh-semantic-recall-0.2.1.tgz`，
+> `https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.2/dsh-semantic-recall-0.2.2.tgz`，
 > 装完提醒我刷新页面。
 
 **方式 B：自己执行**（创造模式）
 
 ```
 action: install_bundle
-target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.1/dsh-semantic-recall-0.2.1.tgz
+target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.2/dsh-semantic-recall-0.2.2.tgz
 ```
 
 **方式 C：从源码目录装**
@@ -346,11 +346,11 @@ $DSH_HOME/session-recall/config.json      # Windows: C:\Users\<你>\.dsh\session
 ## 安装（给第一次用的人）
 
 > **现状（2026-11-01）**：npm 上暂未发布——npm 已关闭命令行建号，网页注册又被反爬拦住了。
-> 现在用 **GitHub Release** 分发（最新 **v0.2.1**）：
+> 现在用 **GitHub Release** 分发（最新 **v0.2.2**）：
 >
 > ```
 > action: install_bundle
-> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.1/dsh-semantic-recall-0.2.1.tgz
+> target: https://github.com/zhaohualiuyuejun/dsh-semantic-recall/releases/download/v0.2.2/dsh-semantic-recall-0.2.2.tgz
 > ```
 >
 > 发布到 npm 之后，`target` 直接填包名 `dsh-semantic-recall` 即可（见顶部「一键安装」）。
@@ -464,6 +464,21 @@ node tools/cli.mjs info
 **Q：多源会不会互相查串？**
 不会。每个源一个库，查询按调用方工作区路由；不属于任何源的工作区直接拒绝。
 
+**Q：装上后工具里没有 `session_recall`？**
+先看 bundle 是不是 **enabled**，而不是「装了依赖」。`pluginManager/listBundles` 里
+`installed=true, enabled=false` 时，重启多少次都不会加载，日志里也没有线索；
+用 `pluginManager/setBundleEnabled`（参数扁平 `{ name, enabled }`）打开，返回
+`application: "applied"` 就是 HMR 热加载生效，不用重启。
+
+**Q：装完之后整个 DSH 没法对话，一发消息就报错？**
+0.2.1 及更早版本的致命 bug：桌面版把 `@deepseek-ai/dsh-tools` 打进 `app.asar`，插件取不到就落到本地等价实现，
+而它**没有把裸参数表编译成 object 根**，于是模型请求里 `tools[].function.parameters` 缺 `type`，
+DeepSeek 判定整批工具定义非法 ⇒ 该会话所有请求失败。**升到 0.2.2**；急着用就先关掉 bundle。
+
+**Q：直接改 `config.json` 的 `indexDays`，为什么没生效？**
+设置页的 user 层优先级最高（默认值 < 插件 row.config < `config.json` < 设置页）。
+走插件自己的接口最稳：`POST /api/session-recall/config { patch: {...} }`（同时写两层并触发重建）。
+
 ## 已知限制
 
 - 依赖 `session.v4.jsonl.zstd` 这个格式；DSH 升级换了格式要跟着改 `lib/extract.mjs`。
@@ -474,6 +489,7 @@ node tools/cli.mjs info
 
 ## 版本
 
+- `0.2.2`（2026-11-01）：**修复两个会让人以为「DSH 坏了」的 bug**——① `lib/hostdeps.mjs` 的本地等价 `defineTool` 现在会把隐式参数表编译成 `{ type:'object', properties }` 根节点（桌面版取不到宿主 `dsh-tools` 时，旧版会让模型请求里的工具定义非法，**导致整场对话 400**）；② `lib/embed.mjs` 在嵌入前清洗落单 UTF-16 代理项（emoji 被截半），批量 400 时改为逐条重试、坏块用 `null` 占位跳过（旧版一条坏块连坐整批，表现是「切块 1608 / 0 块成功」）。README 补 bundle `enabled` 排查与设置优先级两条 FAQ。验证脚本：`tools/verify-fix-0.2.2.mjs`。
 - `0.2.1`（2026-10-31）：**源工作区隔离 + 多源分库**——每个源一个独立库（`scopes/<源>/`），按调用方工作区路由；源之间互斥，单源可含任意工作区；非源工作区直接拒绝。新增对外锚点（`session` / `messageId` / `seq`）与 `session_recall({ session })` 原文下钻；跨通道（QQ / 微信）从 `tool/call` / `tool/result` 里提取真实对话，并过滤桥接注入；索引天数实时体积预估、Ollama 一键检测、支持只重建指定源；README 补「实测数据」「设计取舍」「FAQ」「跨通道接入」「对外接口约定」。
 - `0.2.0`（2026-10-31）：**首个可对外版本**。自带设置页（界面里填 Key / 勾工作区 / 改天数 / 重建）、改名为 `dsh-semantic-recall`、嵌入改「云端 / 本地」两档、话题卡默认走 DSH 模型、判定改为「高分线 + 词面证据 + 自我引用闸门」。
 - `0.1.0`（2026-10-31）：内部版，旁路 MVP 插件化的第一版。
